@@ -9,10 +9,12 @@ const state = {
   highlightPaths: [],    // 需要高亮的路径(节点id数组的数组)
   role: 'operator',
   actor: '',
+  plan: null,            // 最近一次获取的隔离建议(基于其 revision)
   order: {
     steps: [],           // 浏览器临时编排, 不落库: {action,node_id|device_id}
     result: null,        // 最近一次预演/确认结果
-    kind: null           // 'preview' | 'confirm'
+    kind: null,          // 'preview' | 'confirm'
+    planRevision: null   // 步骤来自隔离建议时, 钉住建议时的 revision(确认必须用它)
   }
 };
 
@@ -40,8 +42,13 @@ async function apiGet(url) {
   return r.json();
 }
 
-async function mutate(method, url, payload) {
-  payload.revision = state.snapshot ? state.snapshot.revision : 1;
+async function mutate(method, url, payload, opts) {
+  lastOrderError = null;
+  lastStaleError = null;
+  // 隔离建议带入的操作单: 确认必须使用建议时的 revision(opts.revision 钉住)
+  payload.revision = opts && opts.revision !== undefined
+    ? opts.revision
+    : (state.snapshot ? state.snapshot.revision : 1);
   payload.actor = state.actor;
   payload.role = state.role;
 
@@ -60,6 +67,7 @@ async function mutate(method, url, payload) {
   }
   // 修订号过期: 用服务器当前状态刷新界面
   if (data.error && data.error.code === 'STALE_REVISION' && data.current) {
+    lastStaleError = data;
     state.snapshot = data.current;
     state.highlightPaths = [];
     render();
@@ -263,8 +271,10 @@ function renderGraph() {
   box.querySelectorAll('[data-node]').forEach((el) => {
     el.addEventListener('click', () => {
       state.selectedNodeId = parseInt(el.dataset.node, 10);
+      state.plan = null; // 切换选中节点时收起旧设备的隔离建议
       renderGraph();
       renderNodeDetail();
+      renderPlan();
     });
   });
   box.querySelectorAll('[data-edge]').forEach((el) => {
@@ -319,6 +329,8 @@ function renderNodeDetail() {
     if (isOp) {
       if (!hasActive) buttons.push(['btn btn-primary', '申请检修许可', () =>
         mutate('POST', '/api/permits', { device_id: n.id })]);
+      // 隔离建议: 基于当前修订号求最少新增挂牌开关, 可带入临时操作单
+      buttons.push(['btn', '查看隔离建议', () => fetchIsolationPlan(n.id)]);
     }
     buttons.push(['btn', '查看供电路径', async () => {
       const data = await apiGet(`/api/devices/${n.id}/paths`);
@@ -355,6 +367,98 @@ function renderNodeDetail() {
 
 function kindBadge(kind) {
   return { source: 'badge-green', switch: 'badge-amber', device: 'badge-purple' }[kind];
+}
+
+// ---------------------------------------------------------------------------
+// 隔离建议: 基于当前修订号的最小挂牌方案, 可带入临时操作单预演/确认
+// ---------------------------------------------------------------------------
+async function fetchIsolationPlan(deviceId) {
+  try {
+    const data = await apiGet(`/api/devices/${deviceId}/isolation-plan`);
+    state.plan = data;
+    renderPlan();
+    if (!data.feasible && data.livePath) {
+      // 不可行: 高亮这条不经过开关的真实带电路径
+      state.highlightPaths = [data.livePath.nodes.map((n) => n.id)];
+      renderGraph();
+    }
+  } catch (e) {
+    toast(`获取隔离建议失败: ${e.message}`, 'error');
+  }
+}
+
+function renderPlan() {
+  const box = $('planBox');
+  const plan = state.plan;
+  if (!plan) { box.innerHTML = ''; return; }
+  const snap = state.snapshot;
+  // 建议只对它所依据的修订号有效; 状态已变则提示重新获取, 不自动改用新方案
+  const stale = snap && snap.revision !== plan.revision;
+  const hasPermit = snap && snap.permits.some((p) => p.device_id === plan.device_id);
+  const canCarry = plan.feasible && plan.orderExecutable && !stale
+    && (plan.steps.length > 0 || !hasPermit);
+
+  let html = `<div class="plan-panel">
+    <div class="plan-title">隔离建议 · ${escapeHtml(plan.device_name)}
+      <span class="hint">基于修订号 ${plan.revision}</span></div>`;
+  if (stale) {
+    html += `<div class="plan-stale">⚠ 网络或开关状态已改变（当前修订号 ${snap.revision}），本建议可能失效；请重新获取，系统不会自动改用新方案。</div>`;
+  }
+  if (!plan.feasible) {
+    html += `<div class="order-head bad">✖ 不可行：存在不经过任何开关的来电通路，无法通过挂牌使设备断电</div>
+      <div class="path-line">带电：${plan.livePath.nodes.map((n) => n.name).join(' → ')}</div>
+      <div class="hint">需由管理员改造拓扑（在该通路上加装开关）后再试。</div>`;
+  } else if (plan.isolated) {
+    html += `<div class="order-head ok">✔ 当前已隔离：所有启用电源的通路均已被挂牌开关切断，无需新增挂牌（空步骤）。</div>`;
+  } else {
+    html += `<div class="plan-sub">需新增挂牌 <b>${plan.minTags}</b> 个开关（最少方案）：</div>`
+      + plan.switches.map((sw) =>
+        `<div class="plan-switch">🔧 ${escapeHtml(sw.name)} <span class="hint">#${sw.node_id} · 当前${sw.open_pos ? '分闸' : '合闸'}</span></div>`).join('')
+      + `<div class="plan-sub">步骤（按状态先分闸再挂牌，共 ${plan.stepCount} 步）：</div>`
+      + plan.steps.map((s, i) => {
+        const sw = plan.switches.find((x) => x.node_id === s.node_id);
+        return `<div class="order-step ok">第 ${i + 1} 步 · ${ORDER_ACTION_LABEL[s.action]} · ${escapeHtml(sw ? sw.name : `#${s.node_id}`)}</div>`;
+      }).join('');
+    if (!plan.orderExecutable) {
+      html += `<div class="plan-stale">⚠ 共 ${plan.stepCount} 步，超出临时操作单步数上限 ${plan.maxOrderSteps}，不可整单执行；以上步骤完整未截断，请分批人工执行。</div>`;
+    }
+  }
+  html += '<div class="plan-actions" id="planActions"></div></div>';
+  box.innerHTML = html;
+
+  const actions = $('planActions');
+  const addBtn = (cls, label, fn) => {
+    const b = document.createElement('button');
+    b.className = `btn btn-sm ${cls}`;
+    b.textContent = label;
+    b.addEventListener('click', fn);
+    actions.appendChild(b);
+  };
+  if (canCarry) {
+    addBtn('btn-primary', '带入操作单', carryPlanIntoOrder);
+  }
+  if (stale) addBtn('', '重新获取', () => fetchIsolationPlan(plan.device_id));
+  addBtn('', '关闭', () => { state.plan = null; renderPlan(); });
+}
+
+// 把建议步骤装入临时操作单(末步补申请许可), 并钉住建议时的 revision:
+// 确认必须使用建议时的 revision; 期间网络或开关状态改变将收到 STALE_REVISION。
+function carryPlanIntoOrder() {
+  const plan = state.plan;
+  if (!plan || !plan.feasible) return;
+  if (state.snapshot.revision !== plan.revision) {
+    toast('网络或开关状态已改变，请重新获取隔离建议', 'error');
+    return;
+  }
+  state.order.steps = plan.steps.map((s) => ({ ...s }));
+  const hasPermit = state.snapshot.permits.some((p) => p.device_id === plan.device_id);
+  if (!hasPermit) state.order.steps.push({ action: 'permit', device_id: plan.device_id });
+  state.order.planRevision = plan.revision;
+  state.order.result = null;
+  document.querySelector('.tab[data-tab="orders"]').click();
+  renderOrderEditor();
+  renderOrderResult();
+  toast(`已带入 ${state.order.steps.length} 步（基于修订号 ${plan.revision}）。\n确认执行将使用该修订号；期间若网络或开关状态改变，将收到 STALE_REVISION 并刷新为当前完整状态。`, 'info');
 }
 
 // ---------------------------------------------------------------------------
@@ -442,6 +546,14 @@ function renderOrderEditor() {
   const snap = state.snapshot;
   if (!snap) return;
   refreshOrderTargets();
+  // 步骤来自隔离建议时: 确认必须使用建议时的 revision, 手工增删后解除关联
+  const note = $('orderPlanNote');
+  if (state.order.planRevision != null) {
+    note.innerHTML = `<div class="order-permit">本单步骤来自修订号 ${state.order.planRevision} 的隔离建议，确认执行将使用该修订号。
+      期间网络或开关状态若已改变，确认将被拒绝（STALE_REVISION）并刷新为当前完整状态，不会自动改用新方案；手工增删步骤后该关联解除。</div>`;
+  } else {
+    note.innerHTML = '';
+  }
   const tbody = $('orderGrid').querySelector('tbody');
   if (!state.order.steps.length) {
     tbody.innerHTML = '<tr><td colspan="4" class="hint">还没有步骤。</td></tr>';
@@ -561,9 +673,13 @@ async function orderPreview() {
 
 async function orderConfirm() {
   if (!state.order.steps.length) return toast('请先编排至少一个步骤', 'error');
-  if (!confirm(`确认按当前顺序原子执行这 ${state.order.steps.length} 个步骤？\n任一步失败整单回滚、不落库。`)) return;
-  const data = await mutate('POST', '/api/orders/confirm', { steps: state.order.steps });
+  const pinned = state.order.planRevision;
+  if (!confirm(`确认按当前顺序原子执行这 ${state.order.steps.length} 个步骤？\n任一步失败整单回滚、不落库。`
+    + (pinned != null ? `\n本单来自修订号 ${pinned} 的隔离建议，确认将使用该修订号。` : ''))) return;
+  const data = await mutate('POST', '/api/orders/confirm', { steps: state.order.steps },
+    pinned != null ? { revision: pinned } : undefined);
   if (data) {
+    state.order.planRevision = null;
     state.order.result = {
       success: true, failedStep: null, error: null,
       revision: data.revision, steps: state.order.result ? state.order.result.steps : [],
@@ -581,11 +697,18 @@ async function orderConfirm() {
     };
     state.order.kind = 'confirm';
     renderOrderResult();
+  } else if (pinned != null && lastStaleError) {
+    // 建议所依据的修订号已过期: mutate 已把界面刷新为当前完整状态;
+    // 不自动改用新方案 —— 解除钉住, 提示重新获取隔离建议。
+    state.order.planRevision = null;
+    renderOrderEditor();
+    toast(`隔离建议基于修订号 ${pinned}，期间网络或开关状态已改变。\n不会自动改用新方案，请重新获取隔离建议。`, 'error');
   }
 }
 
-// 供 orderConfirm 读取最近一次确认失败的步骤明细
+// 供 orderConfirm 读取最近一次确认失败的步骤明细 / 修订号过期详情
 let lastOrderError = null;
+let lastStaleError = null;
 
 // ---------------------------------------------------------------------------
 // 渲染: 管理页
@@ -666,6 +789,7 @@ function render() {
   renderPermits();
   renderAdmin();
   renderOrderEditor();
+  renderPlan();
 }
 
 function toast(message, kind) {
@@ -759,6 +883,7 @@ $('orderAddBtn').addEventListener('click', () => {
   steps.push(action === 'permit'
     ? { action: 'permit', device_id: target }
     : { action, node_id: target });
+  state.order.planRevision = null; // 手工增删步骤后, 与隔离建议的关联解除
   state.order.result = null;
   renderOrderEditor();
   renderOrderResult();
@@ -778,6 +903,7 @@ $('orderGrid').addEventListener('click', (ev) => {
     const [p] = steps.splice(permitIdx, 1);
     steps.push(p);
   }
+  state.order.planRevision = null; // 手工调整步骤后, 与隔离建议的关联解除
   state.order.result = null;
   renderOrderEditor();
   renderOrderResult();
@@ -786,6 +912,7 @@ $('orderPreviewBtn').addEventListener('click', orderPreview);
 $('orderConfirmBtn').addEventListener('click', orderConfirm);
 $('orderClearBtn').addEventListener('click', () => {
   state.order.steps = [];
+  state.order.planRevision = null;
   state.order.result = null;
   renderOrderEditor();
   renderOrderResult();

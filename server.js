@@ -15,6 +15,7 @@ const {
   simulateOrder,
   commitOrder
 } = require('./src/orders');
+const { computeIsolationPlan } = require('./src/plan');
 
 const PORT = parseInt(process.env.PORT || '3000', 10);
 const DB_PATH = process.env.LOTO_DB || path.join(__dirname, 'data', 'loto.db');
@@ -213,6 +214,36 @@ app.get('/api/devices/:id/paths', wrap((req, res) => {
     livePaths: r.livePaths.map((p) => serializePath(graph, p)),
     blockedPaths: r.blockedPaths.map((p) => serializePath(graph, p)),
     truncated: r.truncated
+  });
+}));
+
+// 隔离建议(只读): 基于当前修订号, 在“所有启用电源 → 设备”的完整供电图上
+// 求使设备断电所需新增挂牌开关数最少的一组开关(最小节点割; 已挂牌开关视作屏障)。
+// 不依赖限量诊断路径枚举; 步骤与临时操作单同构, 可直接带入预演/确认,
+// 确认时必须携带本响应的 revision —— 期间网络或开关状态改变将按既有约定
+// 返回 409 STALE_REVISION 与当前完整状态, 不自动改用新方案。
+app.get('/api/devices/:id/isolation-plan', wrap((req, res) => {
+  const id = parseInt(req.params.id, 10);
+  const graph = loadGraph();
+  const node = graph.nodeById.get(id);
+  if (!node || node.kind !== 'device') throw new ApiError(404, 'NOT_FOUND', '设备不存在');
+  const plan = computeIsolationPlan(graph, id);
+  res.json({
+    ok: true,
+    kind: 'isolation.plan',
+    revision: currentRevision(), // 建议所依据的修订号
+    device_id: id,
+    device_name: node.name,
+    feasible: plan.feasible,       // false: 存在不经过开关的来电通路, 无法靠挂牌隔离
+    isolated: plan.isolated,       // true: 当前已隔离, steps 为空
+    minTags: plan.minTags,         // 最少新增挂牌开关数
+    switches: plan.switches,       // 建议挂牌的开关(含当前分合/挂牌状态)
+    steps: plan.steps,             // 按状态先分闸再挂牌; 与操作单步骤同构
+    stepCount: plan.stepCount,
+    maxOrderSteps: plan.maxOrderSteps,
+    orderExecutable: plan.orderExecutable, // false: 超出单据步数上限, 不可整单执行(步骤不截断)
+    // 不可行时: 一条真实的不经过开关的带电路径(完整 BFS 见证, 可超展示长度上限)
+    livePath: plan.livePath ? serializePath(graph, plan.livePath) : null
   });
 }));
 
