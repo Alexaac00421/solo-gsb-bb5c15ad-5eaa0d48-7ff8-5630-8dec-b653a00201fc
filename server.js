@@ -13,8 +13,10 @@ const {
   ACTION_LABEL,
   normalizeSteps,
   simulateOrder,
-  commitOrder
+  commitOrder,
+  MAX_STEPS: MAX_ORDER_STEPS
 } = require('./src/orders');
+const { planIsolation } = require('./src/advisor');
 
 const PORT = parseInt(process.env.PORT || '3000', 10);
 const DB_PATH = process.env.LOTO_DB || path.join(__dirname, 'data', 'loto.db');
@@ -213,6 +215,57 @@ app.get('/api/devices/:id/paths', wrap((req, res) => {
     livePaths: r.livePaths.map((p) => serializePath(graph, p)),
     blockedPaths: r.blockedPaths.map((p) => serializePath(graph, p)),
     truncated: r.truncated
+  });
+}));
+
+// 只读隔离建议: 基于当前修订号的完整供电图(无数量/长度上限), 求使设备断电
+// 所需“新增挂牌开关数最少”的一组开关, 并给出按状态先分闸再挂牌的步骤。
+// 已隔离 -> feasible + 空步骤; 存在不经过开关的来电通路 -> 422 不可行 + 一条真实路径。
+// 只读接口, 不校验身份、不改变修订号/审计; 响应携带建议所依据的 revision,
+// 调用方应把 steps 直接带入 /api/orders/preview|confirm, 确认必须使用该 revision。
+app.get('/api/devices/:id/isolation-advice', wrap((req, res) => {
+  const id = parseInt(req.params.id, 10);
+  const graph = loadGraph();
+  const node = graph.nodeById.get(id);
+  if (!node || node.kind !== 'device') throw new ApiError(404, 'NOT_FOUND', '设备不存在');
+
+  const plan = planIsolation(graph, id, MAX_ORDER_STEPS);
+  const revision = currentRevision();
+
+  if (!plan.feasible) {
+    // 不可行: 返回 422 与一条真实的“不经过任何开关”的带电路径(完整分析, 非限量枚举)
+    return res.status(422).json({
+      ok: false,
+      error: {
+        code: 'ISOLATION_INFEASIBLE',
+        message: '不存在可行的挂牌隔离方案: 存在不经过任何开关的来电通路, 挂牌无法切断该通路'
+      },
+      revision,
+      device_id: id,
+      device_name: node.name,
+      feasible: false,
+      isolated: false,
+      livePath: serializePath(graph, plan.livePath),
+      livePaths: [serializePath(graph, plan.livePath)]
+    });
+  }
+
+  res.json({
+    ok: true,
+    kind: 'device.isolationAdvice',
+    revision,
+    device_id: id,
+    device_name: node.name,
+    feasible: true,
+    isolated: plan.isolated,
+    // 最少新增挂牌开关; steps 可直接作为临时操作单步骤(全部为 open/tag 开关步)
+    newTagCount: plan.newTagCount,
+    switches: plan.switches,
+    steps: plan.steps,
+    stepCount: plan.stepCount,
+    // 超出现有单据步数上限时明确不可整单执行; 步骤全量返回, 绝不截断
+    withinOrderLimit: plan.withinOrderLimit,
+    orderMaxSteps: plan.orderMaxSteps
   });
 }));
 
@@ -562,6 +615,9 @@ app.post('/api/orders/confirm', wrap((req, res) => {
 app.use((err, req, res, next) => {
   if (err instanceof ApiError || err instanceof OrderError) {
     const body = { ok: false, error: { code: err.code, message: err.message } };
+    // 错误体同样携带当前修订号: 建议/预演后状态已被他人改变时, 调用方按
+    // STALE_REVISION 约定处理, 不自动改用新方案。
+    body.revision = currentRevision();
     if (err.current) body.current = err.current;
     if (err.violations) body.violations = err.violations;
     if (err.livePaths) body.livePaths = err.livePaths;

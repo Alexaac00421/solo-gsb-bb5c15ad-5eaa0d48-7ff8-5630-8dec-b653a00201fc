@@ -12,7 +12,8 @@ const state = {
   order: {
     steps: [],           // 浏览器临时编排, 不落库: {action,node_id|device_id}
     result: null,        // 最近一次预演/确认结果
-    kind: null           // 'preview' | 'confirm'
+    kind: null,          // 'preview' | 'confirm'
+    advice: null         // 载入的隔离建议: {revision, device_id, device_name, data, stale}
   }
 };
 
@@ -40,8 +41,12 @@ async function apiGet(url) {
   return r.json();
 }
 
-async function mutate(method, url, payload) {
-  payload.revision = state.snapshot ? state.snapshot.revision : 1;
+async function mutate(method, url, payload, opts = {}) {
+  // 隔离建议确认时必须使用“建议所依据的 revision”, 可由 opts.revisionOverride 指定;
+  // 其余写操作沿用当前界面修订号。
+  payload.revision = opts.revisionOverride !== undefined
+    ? opts.revisionOverride
+    : (state.snapshot ? state.snapshot.revision : 1);
   payload.actor = state.actor;
   payload.role = state.role;
 
@@ -58,12 +63,20 @@ async function mutate(method, url, payload) {
     toast(`操作成功（新修订号 ${data.revision}）`, 'success');
     return data;
   }
-  // 修订号过期: 用服务器当前状态刷新界面
+  // 修订号过期: 用服务器当前完整状态刷新界面
   if (data.error && data.error.code === 'STALE_REVISION' && data.current) {
     state.snapshot = data.current;
     state.highlightPaths = [];
+    // 建议确认期间网络/开关状态已改变: 沿用 STALE_REVISION 与当前完整状态,
+    // 不自动改用新方案 —— 把已载入的建议标记过期, 需操作员显式重新获取。
+    if (opts.tag === 'order-confirm' && state.order.advice && !state.order.advice.stale) {
+      state.order.advice.stale = true;
+      renderOrderAdvice();
+    }
     render();
-    toast(`⚠ ${data.error.message}\n界面已刷新为他人提交后的最新状态，请核对后重新操作。`, 'error');
+    toast(`⚠ ${data.error.message}\n界面已刷新为他人提交后的最新状态，请核对后重新操作。`
+      + (opts.tag === 'order-confirm' && state.order.advice
+        ? '\n原隔离建议基于旧修订号，已标记为 STALE，不会自动改用新方案。' : ''), 'error');
     return null;
   }
   // 操作单确认失败: 保留步骤明细供结果区展示
@@ -319,6 +332,7 @@ function renderNodeDetail() {
     if (isOp) {
       if (!hasActive) buttons.push(['btn btn-primary', '申请检修许可', () =>
         mutate('POST', '/api/permits', { device_id: n.id })]);
+      buttons.push(['btn btn-warn', '隔离建议（最少挂牌）', () => loadIsolationAdvice(n.id)]);
     }
     buttons.push(['btn', '查看供电路径', async () => {
       const data = await apiGet(`/api/devices/${n.id}/paths`);
@@ -416,8 +430,147 @@ function renderPermits() {
 window.endPermit = (id) => mutate('POST', `/api/permits/${id}/end`, {});
 
 // ---------------------------------------------------------------------------
-// 临时操作单: 编排 / 预演(只读) / 确认(原子执行)
+// 隔离建议: 最少新增挂牌方案(基于所给修订号, 可带入临时操作单预演/确认)
 // ---------------------------------------------------------------------------
+async function loadIsolationAdvice(deviceId) {
+  let data, status;
+  try {
+    const r = await fetch(`/api/devices/${deviceId}/isolation-advice`);
+    status = r.status;
+    data = await r.json().catch(() => ({}));
+  } catch (e) {
+    return toast('隔离建议请求失败', 'error');
+  }
+
+  const curRev = state.snapshot ? state.snapshot.revision : data.revision;
+  // 建议只读、不递增修订号; 但获取期间可能恰好被他人提交, 直接按 STALE 语义提示
+  if (data.revision !== undefined && data.revision !== curRev) {
+    try { await refresh(); } catch (_) {}
+    return toast(`建议所依据修订号(${data.revision})与当前(${curRev})不同，已刷新当前状态，请重新获取建议。`, 'error');
+  }
+
+  if (status === 422 && data.error && data.error.code === 'ISOLATION_INFEASIBLE') {
+    // 不可行: 展示一条真实的“不经过开关”带电路径, 并在图上高亮
+    state.order.advice = { revision: data.revision, device_id: data.device_id,
+      device_name: data.device_name, infeasible: true, livePath: data.livePath, stale: false };
+    if (data.livePath) state.highlightPaths = [data.livePath.nodes.map((x) => x.id)];
+    renderGraph();
+    renderOrderAdvice();
+    switchToOrdersTab();
+    return toast(`✖ ${data.error.message}\n带电路径：`
+      + (data.livePath ? data.livePath.nodes.map((x) => x.name).join(' → ') : ''), 'error');
+  }
+  if (!data.ok) {
+    return toast(`✖ ${data.error ? data.error.message : '隔离建议请求失败'}`, 'error');
+  }
+
+  state.order.advice = { revision: data.revision, device_id: data.device_id,
+    device_name: data.device_name, data, infeasible: false, stale: false };
+  renderOrderAdvice();
+  switchToOrdersTab();
+  if (data.isolated) {
+    toast(`「${data.device_name}」当前已隔离，建议步骤为空（无需新增挂牌，修订号 ${data.revision}）。`, 'success');
+  } else {
+    toast(`建议已生成（修订号 ${data.revision}）：新增挂牌 ${data.newTagCount} 个开关、共 ${data.stepCount} 步，`
+      + (data.withinOrderLimit ? '可载入操作单。' : `超出操作单 ${data.orderMaxSteps} 步上限，不可整单执行（步骤不截断）。`),
+      data.withinOrderLimit ? 'success' : 'error');
+  }
+}
+
+function switchToOrdersTab() {
+  document.querySelectorAll('.tab').forEach((x) => x.classList.toggle('active', x.dataset.tab === 'orders'));
+  document.querySelectorAll('.tabpane').forEach((x) =>
+    x.classList.toggle('active', x.id === 'tab-orders'));
+}
+
+function renderOrderAdvice() {
+  const box = $('orderAdvice');
+  if (!box) return;
+  const a = state.order.advice;
+  if (!a) {
+    box.innerHTML = '<p class="hint">在“供电网络”页点击设备，选择“隔离建议（最少挂牌）”，'
+      + '即可把系统算出的开关与“先分闸、再挂牌”步骤载入本操作单预演 / 确认。'
+      + '建议只依据所给修订号；期间网络或开关状态改变，建议标记为 STALE 且不会自动改用新方案。</p>';
+    syncOrderButtons();
+    return;
+  }
+
+  const staleBanner = a.stale
+    ? `<div class="advice-stale">⚠ STALE_REVISION：建议基于修订号 ${a.revision}，当前网络/开关状态已改变。
+        系统不会自动改用新方案；请清除后对当前状态重新获取建议。</div>` : '';
+
+  if (a.infeasible) {
+    box.innerHTML = staleBanner + `<div class="advice-card bad">
+      <div><b>设备「${escapeHtml(a.device_name)}」#${a.device_id} · 不可行</b>
+        <span class="advice-rev">建议修订号 ${a.revision}</span></div>
+      <div class="advice-msg">存在不经过任何开关的来电通路，新增挂牌无法使设备断电隔离。一条真实带电路径：</div>
+      <div class="path-line">${a.livePath ? a.livePath.nodes.map((n) => escapeHtml(n.name)).join(' → ') : ''}</div>
+      <div class="advice-actions">
+        <button class="btn btn-sm" id="adviceClearBtn">清除建议</button>
+      </div>
+    </div>`;
+  } else {
+    const d = a.data;
+    const head = d.isolated
+      ? `<b>设备「${escapeHtml(a.device_name)}」#${a.device_id} · 当前已隔离</b>`
+      : `<b>设备「${escapeHtml(a.device_name)}」#${a.device_id} · 最少新增挂牌 ${d.newTagCount} 个开关，共 ${d.stepCount} 步</b>`;
+    const limitNote = d.withinOrderLimit ? ''
+      : `<div class="advice-overlimit">✖ 超出操作单 ${d.orderMaxSteps} 步上限：不可整单执行；`
+        + `下列 ${d.stepCount} 步全量列出、不截断，但无法通过本操作单确认（请调整检修方案或联系管理员改变拓扑）。</div>`;
+    const switchList = d.switches.length
+      ? `<div class="hint">挂牌开关：${d.switches.map((s) => `${escapeHtml(s.name)}#${s.node_id}（${s.open_pos ? '已分闸' : '合闸，需先分闸'}）`).join('；')}</div>`
+      : '<div class="hint">无需新增挂牌开关。</div>';
+    box.innerHTML = staleBanner + `<div class="advice-card ${a.stale ? 'stale' : 'ok'}">
+      <div>${head}<span class="advice-rev">建议修订号 ${a.revision}（确认必须使用此修订号）</span></div>
+      ${switchList}${limitNote}
+      <div class="advice-actions">
+        <button class="btn btn-sm btn-primary" id="adviceLoadBtn"
+          ${a.stale || !d.withinOrderLimit || d.isolated ? 'disabled' : ''}>
+          载入操作单预演 / 确认${d.isolated ? '（空步骤）' : ''}
+        </button>
+        <button class="btn btn-sm" id="adviceClearBtn">清除建议</button>
+      </div>
+    </div>`;
+  }
+
+  const loadBtn = $('adviceLoadBtn');
+  if (loadBtn) loadBtn.addEventListener('click', () => adoptAdviceIntoOrder());
+  $('adviceClearBtn').addEventListener('click', () => {
+    state.order.advice = null;
+    renderOrderAdvice();
+  });
+  syncOrderButtons();
+}
+
+function adoptAdviceIntoOrder() {
+  const a = state.order.advice;
+  if (!a || a.stale || a.infeasible) return;
+  const d = a.data;
+  if (!d.withinOrderLimit || d.isolated) return;
+  // 用建议步骤替换当前编排; 确认时固定携带建议 revision(由 orderConfirm 读取)。
+  state.order.steps = d.steps.map((s) => ({ action: s.action, node_id: s.node_id }));
+  state.order.result = null;
+  renderOrderEditor();
+  renderOrderResult();
+  syncOrderButtons();
+  toast(`已载入 ${state.order.steps.length} 步；请先预演，确认将使用建议修订号 ${a.revision}。`, 'success');
+}
+
+// 预演/确认按钮的可用性: 建议 STALE 或方案超出步数上限时禁止整单执行(不截断)。
+function syncOrderButtons() {
+  const a = state.order.advice;
+  const overLimit = a && !a.infeasible && a.data && !a.data.withinOrderLimit;
+  const stale = a && a.stale;
+  const confirmBtn = $('orderConfirmBtn');
+  const previewBtn = $('orderPreviewBtn');
+  if (!confirmBtn || !previewBtn) return;
+  confirmBtn.disabled = !!(stale || overLimit);
+  previewBtn.disabled = !!(stale || overLimit);
+  confirmBtn.title = stale ? '建议已 STALE：请清除后重新获取'
+    : overLimit ? '建议步骤超出操作单步数上限，不可整单执行' : '';
+  previewBtn.title = confirmBtn.title;
+}
+
 function orderTargetName(snap, step) {
   const id = step.action === 'permit' ? step.device_id : step.node_id;
   const n = snap.nodes.find((x) => x.id === id);
@@ -536,6 +689,12 @@ function renderOrderResult() {
 
 async function orderPreview() {
   if (!state.order.steps.length) return toast('请先编排至少一个步骤', 'error');
+  const a = state.order.advice;
+  if (a && a.stale) {
+    return toast('原隔离建议已 STALE：请清除后重新获取建议，再预演 / 确认。', 'error');
+  }
+  // 预演按既有约定永远基于服务器当前状态(不校验 revision); 建议带入的单子
+  // 在建议修订号仍为当前修订号时预演结论才与建议一致, 确认时再强校验建议 revision。
   const r = await fetch('/api/orders/preview', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -561,8 +720,15 @@ async function orderPreview() {
 
 async function orderConfirm() {
   if (!state.order.steps.length) return toast('请先编排至少一个步骤', 'error');
+  const a = state.order.advice;
+  if (a && a.stale) {
+    return toast('原隔离建议已 STALE：不能基于过期建议确认，请清除后重新获取建议。', 'error');
+  }
   if (!confirm(`确认按当前顺序原子执行这 ${state.order.steps.length} 个步骤？\n任一步失败整单回滚、不落库。`)) return;
-  const data = await mutate('POST', '/api/orders/confirm', { steps: state.order.steps });
+  // 建议带入的操作单: 确认必须使用建议所依据的 revision(而非界面当前值)
+  const revisionOverride = a && !a.infeasible && a.data ? a.revision : undefined;
+  const data = await mutate('POST', '/api/orders/confirm', { steps: state.order.steps },
+    { revisionOverride, tag: 'order-confirm' });
   if (data) {
     state.order.result = {
       success: true, failedStep: null, error: null,
@@ -570,6 +736,8 @@ async function orderConfirm() {
       permitIsolation: state.order.result ? state.order.result.permitIsolation : null
     };
     state.order.kind = 'confirm';
+    // 建议已随确认落地消费; 新修订号下旧建议不再有效
+    if (a) { state.order.advice = null; renderOrderAdvice(); }
     renderOrderResult();
   } else if (lastOrderError) {
     state.order.result = {
@@ -666,6 +834,7 @@ function render() {
   renderPermits();
   renderAdmin();
   renderOrderEditor();
+  renderOrderAdvice();
 }
 
 function toast(message, kind) {
@@ -826,6 +995,12 @@ async function refresh() {
       const snap = await apiGet('/api/state');
       if (snap.revision !== state.snapshot.revision) {
         state.snapshot = snap;
+        // 他人提交导致修订号变化: 已载入建议标记 STALE, 不自动改用新方案
+        if (state.order.advice && state.order.advice.revision !== snap.revision
+            && !state.order.advice.stale) {
+          state.order.advice.stale = true;
+          renderOrderAdvice();
+        }
         render();
       }
     } catch (_) { /* 忽略轮询失败 */ }

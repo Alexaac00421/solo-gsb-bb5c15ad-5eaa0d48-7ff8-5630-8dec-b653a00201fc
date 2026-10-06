@@ -184,3 +184,25 @@ details.snapshot pre {
 .toast-error { background: #dc2626; }
 .toast-info { background: #334155; }
 .toast-msg .paths { margin-top: 6px; font-family: ui-monospace, monospace; font-size: 12px; }
+
+/* 隔离建议面板 */
+#orderAdvicePanel { margin-bottom: 14px; }
+.order-advice .hint { margin: 0; }
+.advice-card {
+  border: 1px solid #cbd5e1; border-radius: 8px; padding: 10px 12px;
+  background: #f8fafc; margin-top: 8px;
+}
+.advice-card.ok { border-color: #6ee7b7; background: #f0fdf4; }
+.advice-card.bad { border-color: #fda4af; background: #fff1f2; }
+.advice-card.stale { opacity: .75; border-style: dashed; }
+.advice-rev { float: right; font-size: 12px; color: #64748b; font-weight: 400; }
+.advice-msg { margin: 6px 0; font-size: 13px; }
+.advice-actions { margin-top: 8px; display: flex; gap: 8px; }
+.advice-stale {
+  border: 1px solid #f59e0b; background: #fffbeb; color: #92400e;
+  border-radius: 8px; padding: 8px 10px; font-size: 13px; margin-top: 6px;
+}
+.advice-overlimit {
+  border: 1px solid #dc2626; background: #fff1f2; color: #991b1b;
+  border-radius: 6px; padding: 6px 10px; font-size: 13px; margin: 8px 0;
+}

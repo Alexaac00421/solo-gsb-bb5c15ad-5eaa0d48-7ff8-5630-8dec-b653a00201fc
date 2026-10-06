@@ -89,6 +89,32 @@ HTTP API）临时编排一张操作单：
   `detail.steps` 为有序执行清单，`state_before` / `state_after` 为整单前后完整快照。
 - 操作单本身是浏览器 / 请求里的临时编排，**不建表、不落库**。
 
+### 隔离建议（最少新增挂牌）
+操作员在“供电网络”页选择设备后可查看**基于当前修订号**的隔离建议，也可直接调用
+`GET /api/devices/:id/isolation-advice`。系统在**所有启用电源到设备的完整供电图**上
+求解“使设备断电所需**新增挂牌开关数最少**的一组开关”：
+
+- **已挂牌开关视作屏障**（代价为 0，不计入新增）；问题被建模为有向图**最小顶点割**
+  （割项只允许是未挂牌开关），用拆点 + Dinic 最大流精确求解，**不依赖有数量 / 长度
+  上限的诊断路径枚举**，环路、超长图同样适用。
+- 结果给出建议挂牌的开关，以及**按各开关当前状态**生成的步骤：合闸位置的开关
+  **先分闸（open）再挂牌（tag）**，已分闸的只出挂牌步；步骤可直接作为临时操作单
+  步骤带入预演 / 确认。
+- **设备已隔离**（无启用电源，或所有通路已被挂牌切断）时返回 `isolated:true` 与
+  **空步骤**。
+- **不可行**：若存在一条**不经过任何开关**的来电通路（例如电源直接接线到设备、
+  或无开关旁路），挂牌无法切断它，返回 `422 ISOLATION_INFEASIBLE` 与一条真实
+  带电路径（完整可达性分析给出，非限量枚举）。
+- **修订号约定**：建议响应携带所依据的 `revision`，步骤带入操作单后，**确认必须使用
+  该 revision**；建议生成之后网络或开关状态被他人改变，确认按既有约定返回
+  `409 STALE_REVISION` 与当前完整状态，界面把原建议标记为 **STALE**，
+  **不自动改用新方案**，需操作员显式重新获取。
+- **步数上限**：建议步骤数按现有操作单上限（200 步）给出 `withinOrderLimit`；
+  超限时**明确“不可整单执行”**，但全部步骤仍完整返回、**不截断**，界面禁用
+  预演 / 确认按钮。
+- 建议接口为**只读**：不校验角色、不改变修订号与审计；既有的角色、逐步状态机、
+  事务回滚与审计约定全部继续适用（确认仍走 `/api/orders/confirm`）。
+
 ### 多人并发（乐观锁）
 - 每次成功变更都会让全局 **修订号 revision + 1**（界面右上角实时显示）。
 - 所有写操作必须携带操作者“所见”的 `revision`。
@@ -169,6 +195,11 @@ cp .env.example .env
    点“预演”可反复演练，右侧展示各步前后状态、成功/失败/未执行与目标设备当前及
    按单推演后的隔离状态，真实状态不变；预演通过后点“确认执行”，整单原子落库、
    修订号 +1；若预演后他人已提交，确认会收到 `409 STALE_REVISION` 并自动刷新。
+   也可在“供电网络”页点设备 →“隔离建议（最少挂牌）”，系统基于当前修订号算出
+   最少新增挂牌的开关与“先分闸、再挂牌”步骤并载入操作单；已隔离时建议为空步骤，
+   存在无开关来电通路时提示不可行并高亮该路径；建议面板显示所依据修订号，确认
+   必须使用该修订号，期间他人提交后面板标记 STALE 且不会自动改用新方案；
+   步骤超过单据上限时明确提示不可整单执行（步骤不截断、按钮禁用）。
 4. **检修许可** 页：选择设备申请许可；申请失败时弹窗列出至少一条未切断路径；
    路径数量 / 长度超过诊断上限时，弹窗与许可卡片会用黄色提示标记“仅展示部分
    路径”，但拒绝结论基于完整可达性分析，不受上限影响。有效许可卡片实时显示
@@ -200,6 +231,7 @@ cp .env.example .env
 | GET | `/api/state` | - | 当前完整状态（修订号、节点、边、有效许可、隔离判定与 `truncated` 诊断截断标记） |
 | GET | `/api/health` | - | 健康检查 |
 | GET | `/api/devices/:id/paths` | - | 设备供电路径诊断（限量展示未切断 / 被挂牌切断路径，触顶时 `truncated` 标记截断；`isolated` 以完整可达性分析为准） |
+| GET | `/api/devices/:id/isolation-advice` | - | **隔离建议**（只读）：基于当前修订号求最少新增挂牌开关与先分闸再挂牌步骤；已隔离返回空步骤；无开关来电通路返回 `422 ISOLATION_INFEASIBLE` + 真实带电路径；超步数上限时 `withinOrderLimit:false` 且步骤不截断 |
 | GET | `/api/audit?limit=100` | - | 变更记录（含前后状态快照） |
 | POST | `/api/admin/nodes` | admin | 新增节点 `{kind, name}` |
 | PATCH | `/api/admin/nodes/:id` | admin | 改名 / 启用停用电源 `{name?, enabled?}` |
@@ -284,6 +316,56 @@ curl -s -X POST http://localhost:3000/api/orders/confirm \
 预演请求也需带 `actor` 与 `role:operator`（仅做身份展示与鉴权），但 `revision`
 不参与校验——预演永远基于当前状态推演。
 
+#### 隔离建议 API 示例
+
+```bash
+# 1) 获取设备 6(1#循环水泵)基于当前修订号的最少新增挂牌建议(只读, 无需 revision/角色)
+curl -s http://localhost:3000/api/devices/6/isolation-advice
+# -> 200 { ok:true, kind:"device.isolationAdvice", revision:1,
+#         device_id:6, device_name:"1#循环水泵", feasible:true, isolated:false,
+#         newTagCount:1,
+#         switches:[{node_id:5,name:"联络开关K3",open_pos:false,tagged:false}],
+#         steps:[{action:"open",node_id:5},{action:"tag",node_id:5}],  # 先分闸再挂牌
+#         stepCount:2, withinOrderLimit:true, orderMaxSteps:200 }
+# 演示网络中两路电源在 K3 汇合, 只需新增挂牌 K3(1 个)即可同时切断两路,
+# 优于分别挂 K1、K2(2 个)。
+
+# 2) 已隔离 -> 空步骤
+# -> 200 { ..., feasible:true, isolated:true, switches:[], steps:[],
+#          stepCount:0, newTagCount:0 }
+
+# 3) 存在不经过开关的来电通路 -> 422 不可行 + 一条真实带电路径
+# -> 422 { ok:false, error:{code:"ISOLATION_INFEASIBLE",message:"..."},
+#          revision:7, device_id:7, feasible:false, isolated:false,
+#          livePath:{nodes:[{id:1,kind:"source",name:"1#主电源"},
+#                           {id:7,kind:"device",name:"2#引风机"}], edges:[12]},
+#          livePaths:[ ...同上 ] }
+
+# 4) 把建议 steps 直接带入操作单预演(只读, revision 不校验)
+curl -s -X POST http://localhost:3000/api/orders/preview \
+  -H 'Content-Type: application/json' \
+  -d '{"actor":"张三","role":"operator","revision":1,
+       "steps":[{"action":"open","node_id":5},{"action":"tag","node_id":5}]}'
+
+# 5) 确认必须使用建议所依据的 revision(本例 1); 期间被他人改动 -> 409 STALE_REVISION
+curl -s -X POST http://localhost:3000/api/orders/confirm \
+  -H 'Content-Type: application/json' \
+  -d '{"actor":"张三","role":"operator","revision":1,
+       "steps":[{"action":"open","node_id":5},{"action":"tag","node_id":5}]}'
+# -> 200 { ok:true, action:"order.confirm", revision:2, steps:[...], snapshot:{...} }
+# 409 时 body.current 为当前完整状态; 客户端沿用 STALE_REVISION 处理, 不自动改用新方案。
+
+# 6) 建议所需步骤超过操作单上限(200)时: 明确不可整单执行, 步骤全量返回不截断
+# -> 200 { ..., feasible:true, stepCount:402, withinOrderLimit:false,
+#          orderMaxSteps:200, steps:[ ...402 项, 未截断... ] }
+```
+
+浏览器中的用法：在“供电网络”页点击设备 →“隔离建议（最少挂牌）”，自动跳转到
+“临时操作单”页展示建议面板（建议挂牌开关、步骤数、所依据修订号）；点
+“载入操作单预演 / 确认”即用建议步骤替换当前编排，随后照常预演、确认。
+若期间修订号被他人推进，建议面板出现黄色 **STALE** 提示并禁用确认，
+需“清除建议”后对当前状态重新获取——系统不会自动套用新方案。
+
 ## 目录结构
 
 ```
@@ -295,6 +377,7 @@ curl -s -X POST http://localhost:3000/api/orders/confirm \
 ├── src/
 │   ├── db.js               # SQLite 连接、表结构、演示数据
 │   ├── graph.js            # 完整可达性隔离判定(无上限) + 限量诊断路径枚举
+│   ├── advisor.js          # 隔离建议: 最小新增挂牌点割(拆点 + Dinic 最大流, 无上限)
 │   ├── orders.js           # 临时操作单: 结构校验 + 纯内存预演 + 按序原子提交
 │   └── init-db.js          # 建库脚本(npm run init-db)
 ├── public/                 # 浏览器界面(原生 JS + SVG)
@@ -304,6 +387,8 @@ curl -s -X POST http://localhost:3000/api/orders/confirm \
 └── test/
     ├── smoke.js            # 端到端业务规则冒烟测试(HTTP)
     ├── orders.e2e.js       # 临时操作单预演/确认/原子回滚/STALE_REVISION 的 HTTP 回归
+    ├── advice.e2e.js       # 隔离建议最少挂牌/空步骤/不可行/建议带入单据/409 的 HTTP 回归
+    ├── advisor.test.js     # 隔离建议单元测试(最小割/无开关旁路/环/超长链/步数上限)
     ├── graph.test.js       # 隔离判定单元测试(枚举触顶/超长/环路)
     └── truncation.e2e.js   # 200 条挂牌支路挤掉带电路径的 HTTP 回归(手动)
 ```
@@ -313,6 +398,7 @@ curl -s -X POST http://localhost:3000/api/orders/confirm \
 ```bash
 # 单元测试(无需起服务, 无需数据库)
 npm run test:graph
+npm run test:advisor
 
 # 端到端冒烟(终端1 起服务, 终端2 跑测试; 使用独立 DB 避免污染演示库)
 LOTO_DB=/tmp/loto-test.db PORT=3100 node server.js
@@ -320,6 +406,9 @@ node test/smoke.js
 
 # 临时操作单回归(预演只读/确认原子/逐步失败不可补救/整单回滚/单次修订号/409)
 BASE=http://127.0.0.1:3100 node test/orders.e2e.js
+
+# 隔离建议回归(最少新增挂牌/已隔离空步骤/无开关通路 422/建议带入预演确认/409/只读不审计)
+BASE=http://127.0.0.1:3100 node test/advice.e2e.js
 
 # 枚举触顶回归(同样打到 PORT=3100 的服务; 结束会清理临时拓扑)
 node test/truncation.e2e.js
@@ -338,3 +427,9 @@ node test/smoke.js                            # 终端2
 “前 200 条支路均在挂牌处截断、其后直达设备”的核心回归、超长路径
 （>64 节点）见证路径、含环图、243 条路径数量触顶、违规许可的截断信息，
 共 31 项断言。
+`advisor.test.js` 覆盖：汇合点单开关最小割（演示网络 K3）、已隔离 / 无启用
+电源空步骤、无开关通路与无开关旁路不可行见证、并联支路多点割、已挂牌零成本、
+已分闸只挂牌、含环图、停用电源、>64 节点超长链不依赖枚举上限、201 支路
+402 步超限不截断、结果确定性与自定义上限，共 42 项断言；`advice.e2e.js`
+另覆盖建议只读（不改修订号 / 审计）、带入预演确认、确认必须使用建议
+revision 与 409 STALE_REVISION，共 50 项断言。

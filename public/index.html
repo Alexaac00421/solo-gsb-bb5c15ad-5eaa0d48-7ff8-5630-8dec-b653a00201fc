@@ -71,6 +71,14 @@
 
     <!-- 临时操作单 -->
     <section id="tab-orders" class="tabpane">
+      <div class="panel" id="orderAdvicePanel">
+        <h3>隔离建议（基于修订号的最少新增挂牌方案）</h3>
+        <div id="orderAdvice" class="order-advice">
+          <p class="hint">在“供电网络”页点击设备，选择“隔离建议（最少挂牌）”，
+            即可把系统算出的开关与“先分闸、再挂牌”步骤载入本操作单预演 / 确认。
+            建议只依据所给修订号；期间网络或开关状态改变，建议标记为 STALE 且不会自动改用新方案。</p>
+        </div>
+      </div>
       <div class="layout two-col">
         <div class="panel">
           <h3>编排操作单（按序执行）</h3>
